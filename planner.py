@@ -1,7 +1,9 @@
 """The ONLY place a model is called: one planning call per new runId. Everything it returns is
 validated against the request (catalog, policy, evidence IDs, input schemas) before use."""
-import json, os, re, time
+import json, logging, os, re, time
 import httpx
+
+log = logging.getLogger("uvicorn.error")
 
 EV = re.compile(r"^\s*\[([^\]\s]{1,80})\]")
 
@@ -14,6 +16,23 @@ Rules:
 - effect: exactly ONE tool from policy.effectTools that best responds. If the evidence shows the service is already at its permitted scaling limit/maximum, choose the paging/owner-notification tool instead of scaling. Destructive tools (policy.approvalRequiredFor) only when the evidence supports them, with the exact target named in the evidence. Arguments must match the inputSchema. Cite evidence IDs from your list.
 Output shape:
 {"rootCause":"...","evidence":["id","id"],"diagnostics":[{"toolName":"...","arguments":{},"evidence":["id"]}],"effect":{"toolName":"...","arguments":{},"evidence":["id"]}}"""
+
+def transcript_text(inc):
+    """Transcript may arrive as one string or as a list of lines/objects; normalise to text."""
+    t = inc.get("transcript")
+    if isinstance(t, str):
+        return t
+    if isinstance(t, list):
+        out = []
+        for x in t:
+            if isinstance(x, str):
+                out.append(x)
+            elif isinstance(x, dict):
+                i = x.get("id") or x.get("evidenceId") or x.get("evidence_id")
+                txt = str(x.get("text") or x.get("line") or x.get("content") or "")
+                out.append("[%s] %s" % (i, txt) if i and not txt.lstrip().startswith("[") else txt)
+        return "\n".join(out)
+    return ""
 
 def _lines(transcript):
     out = []
@@ -30,7 +49,7 @@ def _user_message(body):
         "toolCatalog": body["toolCatalog"],
         "policy": {"maximumDiagnostics": pol.get("maximumDiagnostics", 3), "effectTools": pol.get("effectTools", []),
                    "approvalRequiredFor": pol.get("approvalRequiredFor", [])},
-        "transcript": _lines(inc["transcript"]),
+        "transcript": _lines(transcript_text(inc)),
     }, ensure_ascii=False)
 
 def _call_llm(body, deadline):
@@ -39,7 +58,7 @@ def _call_llm(body, deadline):
         raise RuntimeError("LLM_API_KEY not set")
     base = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    payload = {"model": model, "temperature": 0, "max_tokens": 1500,
+    payload = {"model": model, "temperature": 0, "max_tokens": 4000,
                "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": _user_message(body)}],
                "response_format": {"type": "json_object"}}
     last = None
@@ -117,7 +136,7 @@ def _validate(raw, body):
     if not isinstance(raw, dict):
         return None
     inc, pol = body["incident"], body["policy"]
-    known = {m.group(1) for m in map(EV.match, str(inc["transcript"]).splitlines()) if m}
+    known = {m.group(1) for m in map(EV.match, transcript_text(inc).splitlines()) if m}
     causes = inc["allowedRootCauses"]
     rc = raw.get("rootCause")
     if rc not in causes:
@@ -158,7 +177,7 @@ def _fallback(body):
     """Only used if the model call fails or returns something unusable. Conservative and generic."""
     inc, pol = body["incident"], body["policy"]
     ids = []
-    for ln in str(inc["transcript"]).splitlines():
+    for ln in transcript_text(inc).splitlines():
         m = EV.match(ln)
         if m and m.group(1) not in ids:
             ids.append(m.group(1))
@@ -190,8 +209,12 @@ def make_plan(body):
     try:
         raw, model = _call_llm(body, deadline)
         plan = _validate(raw, body)
-    except Exception:
+    except Exception as e:  # noqa
+        log.warning("planner: model call failed (%s)", type(e).__name__)
         plan = None
     if plan is None:
+        log.warning("planner: using fallback plan")
         plan = _fallback(body)
+    else:
+        log.info("planner: model plan accepted")
     return plan, model, t0, time.time_ns()

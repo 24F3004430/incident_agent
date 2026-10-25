@@ -1,11 +1,13 @@
-import json, time
+import json, logging, re, time
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 import engine, planner, store
+from asgi_wrap import Wrap, REQUESTS, SHAPES, shape
 
 PROFILE = "ga5-incident-agent/v2"
+log = logging.getLogger("uvicorn.error")
 app = FastAPI(title="Incident agent", docs_url=None, redoc_url=None, openapi_url=None)
 store.init_db()
 
@@ -16,7 +18,15 @@ def err(code, msg):  # generic messages only: never echo request content
 async def _v(_req, _exc): return err(422, "invalid request")
 
 @app.exception_handler(Exception)
-async def _e(_req, _exc): return err(500, "internal error")
+async def _e(_req, exc):
+    log.error("unhandled %s", type(exc).__name__, exc_info=exc)
+    return err(500, "internal error")
+
+app.router.redirect_slashes = False
+
+@app.get("/debug/requests")
+def debug_requests():
+    return {"requests": list(reversed(REQUESTS)), "createShapes": list(reversed(SHAPES))}
 
 @app.get("/health")
 def health(): return {"status": "ok"}
@@ -26,7 +36,8 @@ def _validate(b):
     inc, pol = b.get("incident"), b.get("policy")
     if not (ne(b.get("runId")) and len(b["runId"]) <= 200 and ne(b.get("publicMarker"))):
         return "runId and publicMarker required"
-    if not isinstance(inc, dict) or not isinstance(inc.get("transcript"), str) or not inc["transcript"]:
+    tr = inc.get("transcript") if isinstance(inc, dict) else None
+    if not isinstance(inc, dict) or not isinstance(tr, (str, list)) or not tr:
         return "incident.transcript required"
     rc = inc.get("allowedRootCauses")
     if not isinstance(rc, list) or not rc or not all(isinstance(x, str) for x in rc):
@@ -36,8 +47,6 @@ def _validate(b):
         return "toolCatalog required"
     if not isinstance(pol, dict) or not isinstance(pol.get("effectTools", []), list):
         return "policy required"
-    if "sensitive" in b and not isinstance(b["sensitive"], dict):
-        return "sensitive must be an object"
     return None
 
 async def _json(request, limit=8_000_000):
@@ -50,10 +59,15 @@ async def _json(request, limit=8_000_000):
 @app.post("/v2/incidents")
 async def create_incident(request: Request):
     body = await _json(request)
-    if body is None: return err(400, "body must be a JSON object")
-    if body.get("profile") != PROFILE: return err(400, "unsupported profile")
+    if body is None:
+        log.warning("create rejected: body is not a JSON object"); return err(400, "body must be a JSON object")
+    if body.get("profile") != PROFILE:
+        SHAPES.append(shape(body))
+        log.warning("create rejected: unsupported profile"); return err(400, "unsupported profile")
+    SHAPES.append(shape(body))
     problem = _validate(body)
-    if problem: return err(422, problem)
+    if problem:
+        log.warning("create rejected: %s", problem); return err(422, problem)
     tp, ts = request.headers.get("traceparent"), request.headers.get("tracestate")
     return await run_in_threadpool(_create, body, tp, ts)
 
@@ -65,7 +79,8 @@ def _create(body, tp, ts):
             return JSONResponse(old["first"]) if old["digest"] == dg else err(409, "runId reused with different content")
         t0 = time.time_ns()
         plan, model, c0, c1 = planner.make_plan(body)
-        if plan is None: return err(502, "planning failed")
+        if plan is None:
+            log.error("planning produced no usable plan"); return err(502, "planning failed")
         state, resp = engine.start_run(body, engine.trace_context(tp, ts, body), plan, model, t0, c0, c1)
         store.create_run(run_id, dg, state, resp)
         return JSONResponse(resp)
@@ -98,3 +113,5 @@ def read_incident(run_id: str):
     run = store.get_run(run_id)
     if not run: return err(404, "unknown run")
     return JSONResponse(engine.view(run["state"]))
+
+app = Wrap(app)  # uvicorn serves this wrapper; routes above are unchanged
