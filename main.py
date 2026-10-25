@@ -26,7 +26,7 @@ app.router.redirect_slashes = False
 
 @app.get("/debug/requests")
 def debug_requests():
-    return {"requests": list(reversed(REQUESTS)), "createShapes": list(reversed(SHAPES))}
+    return {"plans": list(reversed(planner.PLANS)), "requests": list(reversed(REQUESTS)), "createShapes": list(reversed(SHAPES))}
 
 @app.get("/health")
 def health(): return {"status": "ok"}
